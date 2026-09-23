@@ -1,0 +1,373 @@
+From 7a64bde237102a71d1d80082d47947fe481b3603 Mon Sep 17 00:00:00 2001
+From: Mika Kahola <mika.kahola@kolumbus.fi>
+Date: Fri, 18 Sep 2026 09:58:32 +0000
+Subject: [PATCH 2/3] media: vimc: add synthetic HSI16 mosaic sensor node
+
+Add an HSI16 synthetic mosaic sensor entity to the vimc test driver,
+intended to be linked directly to a raw capture node with no debayer in
+between, since a 16-band spectral mosaic is not something a Bayer
+debayer can interpret.
+
+Generates a deterministic pattern encoding band_index * 64 + ramp, so a
+demosaic implementation under test can be checked both for correct band
+routing and for preserved spatial detail. Two mbus codes are offered on
+the source pad: SRGGB10_1X10 (default, full precision) and Y8_1X8, an
+8-bit truncated view-only preview that pairs with V4L2_PIX_FMT_GREY.
+
+This exercises the real media-controller graph and vb2 capture path
+without silicon. It deliberately does not model hsi16.c's register
+plane -- CONFIG_HSI16_FAKE_HW in that driver covers the control plane.
+---
+ .../test-drivers/vimc/vimc-sensor-hsi16.c     | 340 ++++++++++++++++++
+ 1 file changed, 340 insertions(+)
+ create mode 100644 drivers/media/test-drivers/vimc/vimc-sensor-hsi16.c
+
+diff --git a/drivers/media/test-drivers/vimc/vimc-sensor-hsi16.c b/drivers/media/test-drivers/vimc/vimc-sensor-hsi16.c
+new file mode 100644
+index 000000000000..088b20e82976
+--- /dev/null
++++ b/drivers/media/test-drivers/vimc/vimc-sensor-hsi16.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * vimc-sensor-hsi16.c  Synthetic HSI16 16-band mosaic sensor for vimc
++ *
++ * Structurally mirrors vimc-sensor.c, with the TPG colour-bar
++ * generator replaced by a fixed 4x4 (16-band) spectral mosaic test
++ * pattern, and the format table narrowed to two fixed mbus codes --
++ * this entity exists to exercise the real media-controller graph and
++ * vb2 capture path with a plausible pixel source, not to be a
++ * general test-pattern sensor.
++ *
++ * Deliberately does NOT model hsi16.c's I2C/register control plane;
++ * see CONFIG_HSI16_FAKE_HW in that driver for the control-plane
++ * harness. This node only stands in for the pixel source and the
++ * media topology.
++ *
++ * Copyright (C) 2026 Example Corp.
++ */
++
++#include <linux/vmalloc.h>
++#include <media/v4l2-subdev.h>
++
++#include "vimc-common.h"
++
++#define HSI16_MOSAIC_PERIOD	4	/* 4x4 = 16 bands */
++#define HSI16_ADC_MAX		1023	/* 10-bit, matches hsi16.c */
++#define HSI16_WIDTH		2048
++#define HSI16_HEIGHT		1536
++
++/*
++ * Two supported codes on the single source pad, switched via set_fmt:
++ *
++ *  - SRGGB10_1X10 (default): full 10-bit-in-16-bit mosaic, u16
++ *    samples. Use this for real demosaic/calibration testing.
++ *  - Y8_1X8: 8-bit truncated preview (top 8 bits of the same
++ *    values), u8 samples. View-only -- the low 2 bits are gone.
++ *    Exists so the pattern can be looked at directly (e.g. in VLC
++ *    via V4L2_PIX_FMT_GREY) without a demosaic step.
++ */
++static const u32 hsi16_mbus_codes[] = {
++	MEDIA_BUS_FMT_SRGGB10_1X10,
++	MEDIA_BUS_FMT_Y8_1X8,
++};
++
++struct vimc_sensor_hsi16_device {
++	struct vimc_ent_device ved;
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	/*
++	 * Non-NULL while streaming; also doubles as the -EBUSY guard
++	 * against format changes mid-stream, same pattern
++	 * vimc-sensor.c uses with its own ->frame pointer. Raw byte
++	 * buffer -- 1 or 2 bytes/sample depending on the active code,
++	 * see hsi16_bpp().
++	 */
++	void *frame;
++
++	struct v4l2_mbus_framefmt mbus_format;
++};
++
++static const struct v4l2_mbus_framefmt hsi16_fmt_default = {
++	.width = HSI16_WIDTH,
++	.height = HSI16_HEIGHT,
++	.code = MEDIA_BUS_FMT_SRGGB10_1X10,
++	.field = V4L2_FIELD_NONE,
++	.colorspace = V4L2_COLORSPACE_RAW,
++};
++
++/* -------------------------------------------------------------------- */
++/* Format helpers                                                        */
++
++static bool hsi16_code_supported(u32 code)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(hsi16_mbus_codes); i++)
++		if (hsi16_mbus_codes[i] == code)
++			return true;
++	return false;
++}
++
++static unsigned int hsi16_bpp(u32 code)
++{
++	return code == MEDIA_BUS_FMT_Y8_1X8 ? 1 : 2;
++}
++
++/* -------------------------------------------------------------------- */
++/* Pattern generation                                                    */
++
++/*
++ * Same encoding as the userspace v4l2loopback emulator companion
++ * script, deliberately kept identical so ground-truth-checking test
++ * code can be shared between the two harnesses:
++ *
++ *   value = band_index * 64 + spatial_ramp
++ *   band_index = (row % 4) * 4 + (col % 4)
++ *
++ * Stored as u16 per sample for the default code (matching
++ * V4L2_PIX_FMT_SRGGB10's 16-bit container with data in the low 10
++ * bits), or u8 (top 8 bits only) for the Y8_1X8 preview code. Not
++ * bit-packed either way -- vimc's frame buffers are plain sample
++ * arrays, same as every other format this driver emulates.
++ */
++static void hsi16_fill_mosaic(void *buf, unsigned int width,
++			       unsigned int height, u32 code)
++{
++	bool preview = (code == MEDIA_BUS_FMT_Y8_1X8);
++	unsigned int row, col;
++	u16 *buf16 = buf;
++	u8 *buf8 = buf;
++
++	for (row = 0; row < height; row++) {
++		u16 band_row = (row % HSI16_MOSAIC_PERIOD) * HSI16_MOSAIC_PERIOD;
++		u16 ramp_row = (row * 64 / height) % 64;
++
++		for (col = 0; col < width; col++) {
++			u16 band = band_row + (col % HSI16_MOSAIC_PERIOD);
++			u16 ramp = (ramp_row + (col * 64 / width)) % 64;
++			u16 val = min_t(u16, band * 64 + ramp, HSI16_ADC_MAX);
++
++			if (preview)
++				buf8[row * width + col] = val >> 2;
++			else
++				buf16[row * width + col] = val;
++		}
++	}
++}
++
++/* -------------------------------------------------------------------- */
++/* v4l2_subdev_pad_ops                                                   */
++
++static int hsi16_init_state(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *sd_state)
++{
++	unsigned int i;
++
++	for (i = 0; i < sd->entity.num_pads; i++) {
++		struct v4l2_mbus_framefmt *mf =
++			v4l2_subdev_state_get_format(sd_state, i);
++
++		*mf = hsi16_fmt_default;
++	}
++
++	return 0;
++}
++
++static int hsi16_enum_mbus_code(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	/*
++	 * Two fixed codes, deliberately not walking the shared
++	 * vimc_pix_map_list like vimc-sensor.c does -- this sensor
++	 * only ever emits its own two known-good codes.
++	 */
++	if (code->index >= ARRAY_SIZE(hsi16_mbus_codes))
++		return -EINVAL;
++
++	code->code = hsi16_mbus_codes[code->index];
++	return 0;
++}
++
++static int hsi16_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index || !hsi16_code_supported(fse->code))
++		return -EINVAL;
++
++	fse->min_width = fse->max_width = HSI16_WIDTH;
++	fse->min_height = fse->max_height = HSI16_HEIGHT;
++	return 0;
++}
++
++static int hsi16_get_fmt(struct v4l2_subdev *sd,
++			  struct v4l2_subdev_state *sd_state,
++			  struct v4l2_subdev_format *fmt)
++{
++	struct vimc_sensor_hsi16_device *hsi = v4l2_get_subdevdata(sd);
++
++	fmt->format = fmt->which == V4L2_SUBDEV_FORMAT_TRY ?
++		*v4l2_subdev_state_get_format(sd_state, fmt->pad) :
++		hsi->mbus_format;
++
++	return 0;
++}
++
++static int hsi16_set_fmt(struct v4l2_subdev *sd,
++			  struct v4l2_subdev_state *sd_state,
++			  struct v4l2_subdev_format *fmt)
++{
++	struct vimc_sensor_hsi16_device *hsi = v4l2_get_subdevdata(sd);
++	struct v4l2_mbus_framefmt *mf;
++	u32 code = fmt->format.code;
++
++	/*
++	 * Fixed resolution regardless of code; only the code itself is
++	 * actually selectable, between the two supported values. Read
++	 * the caller's requested code BEFORE overwriting fmt->format
++	 * wholesale below, then clamp an unsupported code to the
++	 * default rather than reject it -- same posture as the real
++	 * hsi16.c driver's nearest-mode behaviour.
++	 */
++	if (!hsi16_code_supported(code))
++		code = MEDIA_BUS_FMT_SRGGB10_1X10;
++
++	fmt->format = hsi16_fmt_default;
++	fmt->format.code = code;
++
++	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
++		if (hsi->frame)	/* streaming: refuse, like vimc-sensor.c */
++			return -EBUSY;
++		mf = &hsi->mbus_format;
++	} else {
++		mf = v4l2_subdev_state_get_format(sd_state, fmt->pad);
++	}
++
++	*mf = fmt->format;
++	return 0;
++}
++
++static const struct v4l2_subdev_pad_ops hsi16_pad_ops = {
++	.enum_mbus_code = hsi16_enum_mbus_code,
++	.enum_frame_size = hsi16_enum_frame_size,
++	.get_fmt = hsi16_get_fmt,
++	.set_fmt = hsi16_set_fmt,
++};
++
++/* -------------------------------------------------------------------- */
++/* vimc_ent_device / v4l2_subdev_video_ops                              */
++
++/*
++ * Source entity: no sink pad, so sink_frame is always NULL here.
++ * Matches vimc_sensor_process_frame()'s signature -- vimc's streamer
++ * calls every entity in the pipeline the same way and lets source
++ * entities ignore the input.
++ */
++static void *hsi16_process_frame(struct vimc_ent_device *ved,
++				  const void *sink_frame)
++{
++	struct vimc_sensor_hsi16_device *hsi =
++		container_of(ved, struct vimc_sensor_hsi16_device, ved);
++
++	return hsi->frame;
++}
++
++static int hsi16_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct vimc_sensor_hsi16_device *hsi = v4l2_get_subdevdata(sd);
++
++	if (enable) {
++		unsigned int bpp = hsi16_bpp(hsi->mbus_format.code);
++		size_t frame_size = (size_t)hsi->mbus_format.width *
++				     hsi->mbus_format.height * bpp;
++
++		hsi->frame = vmalloc(frame_size);
++		if (!hsi->frame)
++			return -ENOMEM;
++
++		hsi16_fill_mosaic(hsi->frame, hsi->mbus_format.width,
++				   hsi->mbus_format.height,
++				   hsi->mbus_format.code);
++	} else {
++		vfree(hsi->frame);
++		hsi->frame = NULL;
++	}
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops hsi16_video_ops = {
++	.s_stream = hsi16_s_stream,
++};
++
++static const struct v4l2_subdev_ops hsi16_subdev_ops = {
++	.pad = &hsi16_pad_ops,
++	.video = &hsi16_video_ops,
++};
++
++static const struct v4l2_subdev_internal_ops hsi16_int_ops = {
++	.init_state = hsi16_init_state,
++};
++
++/* -------------------------------------------------------------------- */
++/* Registration                                                         */
++
++static void vimc_sensor_hsi16_release(struct vimc_ent_device *ved)
++{
++	struct vimc_sensor_hsi16_device *hsi =
++		container_of(ved, struct vimc_sensor_hsi16_device, ved);
++
++	media_entity_cleanup(hsi->ved.ent);
++	kfree(hsi);
++}
++
++static struct vimc_ent_device *
++vimc_sensor_hsi16_add(struct vimc_device *vimc, const char *vcfg_name)
++{
++	struct v4l2_device *v4l2_dev = &vimc->v4l2_dev;
++	struct vimc_sensor_hsi16_device *hsi;
++	int ret;
++
++	hsi = kzalloc(sizeof(*hsi), GFP_KERNEL);
++	if (!hsi)
++		return ERR_PTR(-ENOMEM);
++
++	hsi->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	/*
++	 * NOTE: vimc_ent_sd_register()'s prototype differs between
++	 * kernel versions -- some take a struct v4l2_subdev_internal_ops
++	 * argument before sd_ops, some do not. If this fails to build,
++	 * drop the &hsi16_int_ops argument (and the hsi16_int_ops /
++	 * hsi16_init_state definitions above, which only exist to feed
++	 * it) to match your tree.
++	 */
++	ret = vimc_ent_sd_register(&hsi->ved, &hsi->sd, v4l2_dev,
++				    vcfg_name, MEDIA_ENT_F_CAM_SENSOR,
++				    1, &hsi->pad,
++				    &hsi16_int_ops, &hsi16_subdev_ops);
++	if (ret)
++		goto err_free_hsi;
++
++	v4l2_set_subdevdata(&hsi->sd, hsi);
++	hsi->ved.process_frame = hsi16_process_frame;
++	hsi->ved.dev = vimc->mdev.dev;
++	hsi->mbus_format = hsi16_fmt_default;
++
++	return &hsi->ved;
++
++err_free_hsi:
++	kfree(hsi);
++	return ERR_PTR(ret);
++}
++
++const struct vimc_ent_type vimc_sensor_hsi16_type = {
++	.add = vimc_sensor_hsi16_add,
++	.release = vimc_sensor_hsi16_release,
++};
+-- 
+2.53.0
+

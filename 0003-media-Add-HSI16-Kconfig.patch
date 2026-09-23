@@ -1,0 +1,104 @@
+From 0cf11ee9812978479969f1957de04615b12a02c0 Mon Sep 17 00:00:00 2001
+From: Mika Kahola <mika.kahola@kolumbus.fi>
+Date: Fri, 18 Sep 2026 13:39:09 +0300
+Subject: [PATCH 3/3] media: Add HSI16 Kconfig
+
+Kconfig for HSI16 sensor.
+
+Signed-off-by: Mika Kahola <mika.kahola@kolumbus.fi>
+---
+ drivers/media/i2c/Kconfig                     | 24 +++++++++++++++++++
+ drivers/media/i2c/Makefile                    |  1 +
+ drivers/media/test-drivers/vimc/Makefile      |  3 ++-
+ drivers/media/test-drivers/vimc/vimc-common.c |  8 +++++++
+ drivers/media/test-drivers/vimc/vimc-common.h |  1 +
+ 5 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5c52007f9cbe..32d7f9b379d0 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -1814,3 +1814,27 @@ config VIDEO_MAX96717
+ endmenu
+ 
+ endif # VIDEO_DEV
++
++config VIDEO_HSI16
++	tristate "HSI16 16-band mosaic hyperspectral sensor support"
++	depends on GPIOLIB && I2C && VIDEO_DEV
++	select MEDIA_CONTROLLER
++	select VIDEO_V4L2_SUBDEV_API
++	select V4L2_FWNODE
++	help
++	  Video4Linux2 sensor driver for the HSI16 miniature hyperspectral
++	  image sensor, which uses an on-die Fabry-Perot spectral filter
++	  array to produce a 16-band mosaic over MIPI CSI-2.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called hsi16.
++
++config HSI16_FAKE_HW
++	bool "HSI16: emulate register access instead of real I2C"
++	depends on VIDEO_HSI16
++	help
++	  Replace the HSI16 driver's I2C register backend with an
++	  in-memory model, for control-plane testing (probe, media
++	  topology, format negotiation, streaming state machine) with no
++	  physical sensor attached. Say N unless you are testing this
++	  driver without hardware.
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index d04bd5724552..40e4ced88b39 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -174,3 +174,4 @@ obj-$(CONFIG_VIDEO_VPX3220) += vpx3220.o
+ obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
+ obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
+ obj-$(CONFIG_VIDEO_INTEL_CVS) += cvs/
++obj-$(CONFIG_VIDEO_HSI16)	+= hsi16.o
+diff --git a/drivers/media/test-drivers/vimc/Makefile b/drivers/media/test-drivers/vimc/Makefile
+index 9b9631562473..98071bafdc11 100644
+--- a/drivers/media/test-drivers/vimc/Makefile
++++ b/drivers/media/test-drivers/vimc/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ vimc-y := vimc-core.o vimc-common.o vimc-streamer.o vimc-capture.o \
+-		vimc-debayer.o vimc-scaler.o vimc-sensor.o vimc-lens.o
++		vimc-debayer.o vimc-scaler.o vimc-sensor.o vimc-lens.o \
++		vimc-sensor-hsi16.o
+ 
+ obj-$(CONFIG_VIDEO_VIMC) += vimc.o
+ 
+diff --git a/drivers/media/test-drivers/vimc/vimc-common.c b/drivers/media/test-drivers/vimc/vimc-common.c
+index 4f4fcb26e236..26f09487b933 100644
+--- a/drivers/media/test-drivers/vimc/vimc-common.c
++++ b/drivers/media/test-drivers/vimc/vimc-common.c
+@@ -17,6 +17,14 @@
+  * in the scaler)
+  */
+ static const struct vimc_pix_map vimc_pix_map_list[] = {
++	{
++		/* Plain 8-bit greyscale -- e.g. for view-only/preview
++		 * capture paths that need no colour/Bayer pattern. */
++		.code = { MEDIA_BUS_FMT_Y8_1X8 },
++		.pixelformat = V4L2_PIX_FMT_GREY,
++		.bpp = 1,
++		.bayer = false,
++	},
+ 	/* TODO: add all missing formats */
+ 
+ 	/* RGB formats */
+diff --git a/drivers/media/test-drivers/vimc/vimc-common.h b/drivers/media/test-drivers/vimc/vimc-common.h
+index 861b334ffc65..0c7c2d7c38de 100644
+--- a/drivers/media/test-drivers/vimc/vimc-common.h
++++ b/drivers/media/test-drivers/vimc/vimc-common.h
+@@ -213,6 +213,7 @@ extern const struct vimc_ent_type vimc_debayer_type;
+ extern const struct vimc_ent_type vimc_scaler_type;
+ extern const struct vimc_ent_type vimc_capture_type;
+ extern const struct vimc_ent_type vimc_lens_type;
++extern const struct vimc_ent_type vimc_sensor_hsi16_type;
+ 
+ /**
+  * vimc_pix_map_by_index - get vimc_pix_map struct by its index
+-- 
+2.53.0
+
