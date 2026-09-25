@@ -117,24 +117,38 @@ def build_mosaic_frame(width: int, height: int, fmt: str) -> np.ndarray:
 
 def set_output_format(fd: int, width: int, height: int, fmt: str) -> None:
     spec = FORMATS[fmt]
-    bpp = spec["bytes_per_px"]
     pixelformat = struct.unpack("<I", spec["fourcc"])[0]
 
-    # struct v4l2_format for V4L2_BUF_TYPE_VIDEO_OUTPUT, pix member:
-    # type(u32) + width(u32) height(u32) pixelformat(u32) field(u32)
-    # + bytesperline(u32) + sizeimage(u32) + padding. Packed manually
-    # to avoid pulling in ctypes struct defs.
+    # struct v4l2_format on x86_64/aarch64 (both LP64):
+    #
+    #   __u32 type;                              offset 0
+    #   <4 bytes compiler-inserted padding>       offset 4
+    #   union {
+    #       struct v4l2_pix_format pix;           offset 8 (12 x u32)
+    #       ...
+    #       __u8 raw_data[200];
+    #   } fmt;
+    #                                             total size 208
+    #
+    # The union needs 8-byte alignment (it contains struct v4l2_window,
+    # which contains a pointer), which is *why* the padding after
+    # `type` exists -- easy to miss when hand-packing this, and it was
+    # missed here originally: omitting it shifts every field after
+    # `type` by 4 bytes, so the kernel reads garbage and rejects the
+    # ioctl with EINVAL. This packs the real fields, then pads out to
+    # the full 208 bytes the VIDIOC_S_FMT ioctl number has encoded.
     fmt_struct = struct.pack(
-        "<IIIIIIIIII200x",
+        "<II6I176x",
         V4L2_BUF_TYPE_VIDEO_OUTPUT,
+        0,                               # the alignment pad, explicit
         width,
         height,
         pixelformat,
         V4L2_FIELD_NONE,
-        width * bpp,          # bytesperline
-        width * height * bpp, # sizeimage
-        0, 0, 0,
+        width * spec["bytes_per_px"],    # bytesperline
+        width * height * spec["bytes_per_px"],  # sizeimage
     )
+    assert len(fmt_struct) == 208
     fcntl.ioctl(fd, VIDIOC_S_FMT, fmt_struct)
 
 
